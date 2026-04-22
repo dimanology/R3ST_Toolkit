@@ -30,6 +30,7 @@ import bpy
 import bmesh
 import json
 import math
+import mathutils
 import os
 import re
 import struct
@@ -735,6 +736,13 @@ class R3ST_SetupProps(PropertyGroup):
             ('25',  "Quarter", "Render at 25 % — 16× fewer pixels",   'ALIASED',             2),
         ],
         default='100',
+    )
+    walk_test_speed: FloatProperty(
+        name="Speed",
+        default=0.1, min=0.01, max=0.5,
+        description="Walk test movement speed in Blender units per tick (~20 fps). "
+                    "1 unit = 1 tile = 48 px.",
+        step=1, precision=2,
     )
     active_tab: EnumProperty(
         name="Tab",
@@ -1972,6 +1980,45 @@ class R3ST_PT_main(Panel):
             icon='PAUSE'          if cont_active else 'REC',
         )
 
+        # ── Walk Test ─────────────────────────────────────────────────────────
+        layout.separator(factor=1.2)
+        walk_box = layout.box()
+        walk_box.label(text="Walk Mode", icon='ARMATURE_DATA')
+        wc = walk_box.column(align=True)
+        wc.prop(s, 'walk_test_speed')
+        wc.separator(factor=0.5)
+        walk_active = _r3st_walk['active']
+        char_obj    = _find_walk_character()
+        # Character status — shown before and during walk test
+        if char_obj:
+            wc.label(text=f"Character:  {char_obj.name}", icon='CHECKMARK')
+        else:
+            wc.label(text="No '_character' object found in scene", icon='ERROR')
+        wc.separator(factor=0.3)
+        wr = wc.row()
+        wr.enabled = bool(char_obj) or walk_active   # allow stopping even if obj renamed
+        wr.alert   = walk_active
+        # INVOKE_REGION_WIN: invoke the modal in the 3D viewport WINDOW region
+        # (not the sidebar UI region) so keyboard events reach the modal correctly
+        wr.operator_context = 'INVOKE_REGION_WIN'
+        wr.operator(
+            "r3st.walk_test",
+            text="Stop Walk Mode"  if walk_active else "Start Walk Mode",
+            icon='PAUSE'           if walk_active else 'PLAY',
+        )
+        wc.separator(factor=0.3)
+        col_collision = bpy.data.collections.get('Collision')
+        if col_collision:
+            wc.label(text=f"Collision:  {len(col_collision.objects)} object(s)",
+                     icon='CHECKMARK')
+        else:
+            wc.label(text="No 'Collision' collection — movement unblocked",
+                     icon='INFO')
+        if not walk_active:
+            wc.separator(factor=0.3)
+            wc.label(text="Tip: enable Continuous Render for live feedback",
+                     icon='LIGHT')
+
     # ── Main draw ─────────────────────────────────────────────────────────────
 
     def draw(self, context):
@@ -2557,43 +2604,63 @@ class R3ST_OT_render_preview(Operator):
         restore them in the correct order (distance/location/rotation first,
         perspective last) so the user's free-orbit position is preserved.
         """
+        # ── Force 'Standard' view transform for the capture ──────────────────
+        # render.opengl bakes the ACTIVE view transform into the uint8 TGA bytes.
+        # Our _load_pixels sRGB→linear math assumes those bytes are
+        # Standard-encoded (a simple sRGB/gamma-2.2 curve).
+        # Blender 5.0 defaults to AgX, whose tone curve is NOT invertible with
+        # the sRGB formula → captured bytes come out wrong → image looks dark.
+        # Forcing 'Standard' here keeps the capture predictable regardless of
+        # whatever transform the user has set for their normal viewport work.
+        # 'Raw' is used as fallback if 'Standard' isn't in the current OCIO config.
+        orig_vt = scene.view_settings.view_transform
+        for _vt in ('Standard', 'Raw'):
+            try:
+                scene.view_settings.view_transform = _vt
+                break
+            except Exception:
+                pass
+
         scene.render.filepath = filepath
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type != 'VIEW_3D':
-                    continue
-                space = area.spaces.active
-                r3d   = space.region_3d
+        try:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type != 'VIEW_3D':
+                        continue
+                    space = area.spaces.active
+                    r3d   = space.region_3d
 
-                # Full view-state + overlay snapshot.
-                # .copy() is essential for mathutils Vector/Quaternion (live refs).
-                orig_perspective = r3d.view_perspective
-                orig_location    = r3d.view_location.copy()
-                orig_rotation    = r3d.view_rotation.copy()
-                orig_distance    = r3d.view_distance
-                orig_overlays    = space.overlay.show_overlays
+                    # Full view-state + overlay snapshot.
+                    # .copy() is essential for mathutils Vector/Quaternion (live refs).
+                    orig_perspective = r3d.view_perspective
+                    orig_location    = r3d.view_location.copy()
+                    orig_rotation    = r3d.view_rotation.copy()
+                    orig_distance    = r3d.view_distance
+                    orig_overlays    = space.overlay.show_overlays
 
-                r3d.view_perspective         = 'CAMERA'
-                # Disable overlays so the floor grid, wire edges, etc. are not
-                # baked into the render output.
-                space.overlay.show_overlays  = False
-                try:
-                    for region in area.regions:
-                        if region.type != 'WINDOW':
-                            continue
-                        with bpy.context.temp_override(
-                                window=window, area=area, region=region):
-                            bpy.ops.render.opengl(write_still=True)
-                        return      # done — opengl render succeeded
-                finally:
-                    # Restore spatial state first, perspective last.
-                    r3d.view_distance            = orig_distance
-                    r3d.view_location            = orig_location
-                    r3d.view_rotation            = orig_rotation
-                    r3d.view_perspective         = orig_perspective
-                    space.overlay.show_overlays  = orig_overlays
-        # Fallback: full engine render (slower, no viewport state to worry about)
-        bpy.ops.render.render(write_still=True)
+                    r3d.view_perspective         = 'CAMERA'
+                    # Disable overlays so the floor grid, wire edges, etc. are not
+                    # baked into the render output.
+                    space.overlay.show_overlays  = False
+                    try:
+                        for region in area.regions:
+                            if region.type != 'WINDOW':
+                                continue
+                            with bpy.context.temp_override(
+                                    window=window, area=area, region=region):
+                                bpy.ops.render.opengl(write_still=True)
+                            return      # done — opengl render succeeded
+                    finally:
+                        # Restore spatial state first, perspective last.
+                        r3d.view_distance            = orig_distance
+                        r3d.view_location            = orig_location
+                        r3d.view_rotation            = orig_rotation
+                        r3d.view_perspective         = orig_perspective
+                        space.overlay.show_overlays  = orig_overlays
+            # Fallback: full engine render (slower, no viewport state to worry about)
+            bpy.ops.render.render(write_still=True)
+        finally:
+            scene.view_settings.view_transform = orig_vt
 
     # ── Execute ───────────────────────────────────────────────────────────────
 
@@ -2795,6 +2862,155 @@ _r3st_continuous = {
 
 _R3ST_RIG_NAMES = frozenset((PIVOT_NAME, ARM_NAME, CAM_NAME))
 
+# ── Walk Test state ───────────────────────────────────────────────────────────
+#
+# Plain dict — lives outside operators so the timer, modal, and UI panel all
+# share the same state without any bpy.props overhead.
+
+_r3st_walk = {
+    'active':    False,
+    'keys_held': set(),   # {'W','A','S','D','Q','E'} — keys currently pressed
+    'char_name': None,    # name of the controlled object
+    'running':   False,   # True while Shift is held — uses max speed (0.5)
+}
+
+
+
+# ── AABB collision helpers ────────────────────────────────────────────────────
+
+def _get_world_aabb(obj):
+    """Return (min_v, max_v) world-space Vector3 for obj's bounding box."""
+    corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+    return (
+        mathutils.Vector((min(c.x for c in corners),
+                          min(c.y for c in corners),
+                          min(c.z for c in corners))),
+        mathutils.Vector((max(c.x for c in corners),
+                          max(c.y for c in corners),
+                          max(c.z for c in corners))),
+    )
+
+
+def _aabbs_overlap(min_a, max_a, min_b, max_b):
+    """True if two axis-aligned bounding boxes overlap on all three axes."""
+    return (min_a.x <= max_b.x and max_a.x >= min_b.x and
+            min_a.y <= max_b.y and max_a.y >= min_b.y and
+            min_a.z <= max_b.z and max_a.z >= min_b.z)
+
+
+def _get_collision_objects():
+    """Return all objects in the scene collection named 'Collision'."""
+    col = bpy.data.collections.get('Collision')
+    return list(col.objects) if col else []
+
+
+def _walk_would_collide(character, delta):
+    """
+    Offset the character's AABB by delta and check against all Collision objects.
+    Returns True if any overlap is found.
+    Call once per axis so that per-axis testing in the timer gives wall-sliding.
+    """
+    char_min, char_max = _get_world_aabb(character)
+    test_min = char_min + delta
+    test_max = char_max + delta
+    for col_obj in _get_collision_objects():
+        if col_obj is character:
+            continue
+        col_min, col_max = _get_world_aabb(col_obj)
+        if _aabbs_overlap(test_min, test_max, col_min, col_max):
+            return True
+    return False
+
+
+# ── Walk character lookup ─────────────────────────────────────────────────────
+
+def _find_walk_character():
+    """
+    Return the first scene object whose name is '_character' (case-insensitive).
+    Accepts '_character' and '_Character' (and any other casing).
+    Returns None if nothing matches.
+    """
+    for obj in bpy.data.objects:
+        if obj.name.lower() == '_character':
+            return obj
+    return None
+
+
+# ── Walk Test timer ───────────────────────────────────────────────────────────
+
+def _r3st_walk_timer():
+    """
+    Recurring timer at 0.05 s (≈20 fps).
+    Reads keys_held, computes camera-relative movement, applies per-axis
+    AABB collision, moves the character, and syncs the camera pivot XY.
+    Returns None to self-unregister when walk test is stopped.
+    """
+    st = _r3st_walk
+    if not st['active']:
+        return None   # unregister
+
+    char = bpy.data.objects.get(st['char_name']) if st['char_name'] else None
+    if char is None:
+        st['active'] = False
+        return None
+
+    # Speed: run (max 0.5) while Shift held, walk speed otherwise
+    speed = 0.1
+    try:
+        speed = bpy.context.scene.r3st_setup.walk_test_speed
+    except Exception:
+        pass
+    if st.get('running'):
+        speed = 0.5
+
+    # Camera-relative forward / right vectors derived from pivot yaw
+    pivot   = bpy.data.objects.get(PIVOT_NAME)
+    yaw_deg = float(pivot.get('yaw', 0.0)) if pivot else 0.0
+    yaw_rad = yaw_deg * PI / 180.0
+    #
+    # Derivation (matches R3ST arm driver):
+    #   arm is at  pivot + dist * (sin(yaw), -cos(yaw), ...)
+    #   so camera looks FROM arm TOWARD pivot:
+    #     forward = (-sin(yaw), +cos(yaw), 0)  — W key pushes into screen
+    #     right   = (+cos(yaw), +sin(yaw), 0)  — D key pushes camera-right
+    #
+    fwd   = mathutils.Vector((-math.sin(yaw_rad),  math.cos(yaw_rad), 0.0))
+    right = mathutils.Vector(( math.cos(yaw_rad),  math.sin(yaw_rad), 0.0))
+    up    = mathutils.Vector((0.0, 0.0, 1.0))
+
+    keys  = st['keys_held']
+    delta = mathutils.Vector((0.0, 0.0, 0.0))
+    if 'W' in keys: delta +=  fwd   * speed
+    if 'S' in keys: delta -=  fwd   * speed
+    if 'D' in keys: delta +=  right * speed
+    if 'A' in keys: delta -=  right * speed
+    if 'Q' in keys: delta +=  up    * speed
+    if 'E' in keys: delta -=  up    * speed
+
+    if delta.length_squared > 1e-12:
+        # Per-axis AABB test — lets character slide along walls
+        dx = mathutils.Vector((delta.x, 0.0, 0.0))
+        dy = mathutils.Vector((0.0, delta.y, 0.0))
+        dz = mathutils.Vector((0.0, 0.0, delta.z))
+        if not _walk_would_collide(char, dx): char.location.x += delta.x
+        if not _walk_would_collide(char, dy): char.location.y += delta.y
+        if not _walk_would_collide(char, dz): char.location.z += delta.z
+
+        # Camera pivot follows character XY — Z stays fixed (angle preserved)
+        if pivot:
+            pivot.location.x = char.location.x
+            pivot.location.y = char.location.y
+
+        # The depsgraph handler skips R3ST rig objects to avoid re-rendering on
+        # every orbit drag.  But here the pivot genuinely moved (camera panned),
+        # so the ortho BG pass must re-render.  Dirty it explicitly.
+        if _r3st_continuous['active']:
+            _r3st_continuous['dirty_pass1'] = True
+            _r3st_continuous['dirty_pass2'] = True
+            _r3st_continuous['dirty']       = True
+
+    return 0.05   # reschedule at 20 fps
+
 
 def _r3st_depsgraph_handler(scene, depsgraph):
     """
@@ -2857,7 +3073,11 @@ def _r3st_continuous_timer():
     st = _r3st_continuous
     if not st['active']:
         return None     # stops the timer
-    if st['dirty'] and (time.time() - st['last_time']) >= st['debounce']:
+    # During walk test the pivot moves every 0.05 s — drop the debounce to
+    # near-zero so the ortho BG re-renders each tick and the pan feels live.
+    # Normal editing keeps the full debounce to avoid render spam.
+    effective_debounce = 0.05 if _r3st_walk['active'] else st['debounce']
+    if st['dirty'] and (time.time() - st['last_time']) >= effective_debounce:
         st['dirty']     = False
         st['last_time'] = time.time()
         st['rendering'] = True
@@ -2914,6 +3134,88 @@ class R3ST_OT_continuous_render(Operator):
                     area.tag_redraw()
 
         return {'FINISHED'}
+
+
+# ── Operator: Walk Test ───────────────────────────────────────────────────────
+
+class R3ST_OT_walk_test(Operator):
+    bl_idname      = "r3st.walk_test"
+    bl_label       = "Walk Test"
+    bl_description = (
+        "Enter walk mode: WASD moves the character, Q/E go up/down. "
+        "All other viewport input is blocked while active. ESC to exit."
+    )
+
+    def invoke(self, context, event):
+        # ── Stop (called again while already active) ──────────────────────────
+        if _r3st_walk['active']:
+            self._stop(context)
+            return {'FINISHED'}
+
+        # ── Start ─────────────────────────────────────────────────────────────
+        char = _find_walk_character()
+        if char is None:
+            self.report({'WARNING'},
+                        "No object named '_character' found — "
+                        "name your character '_character' or '_Character'.")
+            return {'CANCELLED'}
+
+        _r3st_walk['char_name'] = char.name
+        _r3st_walk['active']    = True
+        _r3st_walk['keys_held'] = set()
+
+        if not bpy.app.timers.is_registered(_r3st_walk_timer):
+            bpy.app.timers.register(_r3st_walk_timer, first_interval=0.05)
+
+        col     = bpy.data.collections.get('Collision')
+        col_msg = (f"{len(col.objects)} collision object(s)"
+                   if col else "no 'Collision' collection")
+        self.report({'INFO'},
+                    f"Walk mode — '{char.name}'  •  {col_msg}  •  ESC to exit")
+        self._redraw(context)
+
+        # Register the modal handler — because the button uses INVOKE_REGION_WIN,
+        # this is anchored to the 3D viewport WINDOW region, so keyboard events
+        # from the viewport reach the modal reliably.
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        # External stop via the panel "Stop" button
+        if not _r3st_walk['active']:
+            return {'FINISHED'}
+
+        # ESC always exits walk mode
+        if event.type == 'ESC' and event.value == 'PRESS':
+            self._stop(context)
+            return {'FINISHED'}
+
+        # Track WASD+QE held state
+        _MOVE_KEYS = {'W', 'A', 'S', 'D', 'Q', 'E'}
+        if event.type in _MOVE_KEYS:
+            if   event.value == 'PRESS':   _r3st_walk['keys_held'].add(event.type)
+            elif event.value == 'RELEASE': _r3st_walk['keys_held'].discard(event.type)
+
+        # Shift = run (max speed)
+        if event.type in {'LEFT_SHIFT', 'RIGHT_SHIFT'}:
+            _r3st_walk['running'] = (event.value == 'PRESS')
+
+        # Block ALL events — this is an exclusive walk mode, nothing else fires
+        return {'RUNNING_MODAL'}
+
+    def _stop(self, context):
+        _r3st_walk['active']    = False
+        _r3st_walk['keys_held'] = set()
+        _r3st_walk['running']   = False
+        self.report({'INFO'}, "Walk mode exited.")
+        self._redraw(context)
+
+    @staticmethod
+    def _redraw(context):
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
 
 
 # ── Panel 5: Preview ──────────────────────────────────────────────────────────
@@ -3000,6 +3302,7 @@ _classes = (
     R3ST_OT_export_level,
     R3ST_OT_render_preview,
     R3ST_OT_continuous_render,
+    R3ST_OT_walk_test,
     R3ST_PT_main,
     # Old subpanels kept for reference but no longer registered —
     # their content is now drawn directly by R3ST_PT_main._draw_*() methods.
@@ -3018,10 +3321,12 @@ def register():
 
 
 def unregister():
-    # Stop continuous render cleanly before unregistering
+    # Stop continuous render and walk test cleanly before unregistering
     _r3st_continuous['active'] = False
     if _r3st_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_r3st_depsgraph_handler)
+    _r3st_walk['active']    = False
+    _r3st_walk['keys_held'] = set()
 
     del bpy.types.Scene.r3st_setup
     del bpy.types.Scene.r3st_room
