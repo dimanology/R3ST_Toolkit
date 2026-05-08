@@ -19,6 +19,15 @@
  * @desc Comma-separated renderingGroupIds that use perspective projection.
  * All other groups use orthographic (no parallax). Default "2".
  *
+ * @param camBoundDummyId
+ * @text Camera Follow — Dummy Event ID
+ * @type number
+ * @min 1
+ * @default 2
+ * @desc Event ID of the dummy event used as mz3d camera target for smooth
+ * following and boundary clamping. Must match @e<N> in your mz3d camera
+ * config. Set to 0 to disable camera following entirely.
+ *
  * @help r3st_toolkit.js — R3ST Scene plugin for mz3d
  * ════════════════════════════════════════════════════════════════════
  *
@@ -75,8 +84,9 @@
 
   // ── Parameters ────────────────────────────────────────────────────────────
 
-  const params        = PluginManager.parameters('r3st_toolkit');
-  const PARAM_ENABLED = params.enabled !== 'false';
+  const params          = PluginManager.parameters('r3st_toolkit');
+  const PARAM_ENABLED   = params.enabled !== 'false';
+  const CAM_BOUND_EVENT = Number(params.camBoundDummyId) || 2;
 
   const PERSP_GROUPS = new Set(
     (params.perspectiveGroups || '2')
@@ -424,11 +434,85 @@
     },
   });
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  CAMERA BOUNDARY  (replaces mz3d_smoothclamp.js)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Reads <r3st_cam_border>left,right,top,bottom</r3st_cam_border> from the
+  // map note on each map load.  The tag is written by the R3ST Blender add-on
+  // when the camera is exported, so every map carries its own border values.
+  //
+  // A dummy event (fixed position, Through ON, no graphic) is used as the mz3d
+  // camera target (@e<camBoundDummyId> in the map note / mz3d config).  Every
+  // frame the dummy's position is clamped to the player's position within the
+  // boundary rectangle, creating the smooth "camera stops at map edges" effect.
+  //
+  // Setup (same as the old smoothclamp.js):
+  //   1. Create a dummy event on every map — Through ON, Fixed, no graphic.
+  //   2. Set its event ID to match the "Camera Follow — Dummy Event ID" param.
+  //   3. In the mz3d map note add:  camera(yaw,pitch|dist|height|@e<ID>)
+  //      or set mz3d's camera target to @e<ID> however your version supports it.
+  //   4. Export camera from Blender with Camera Boundary enabled → the
+  //      <r3st_cam_border> tag is written to MapXXX.json automatically.
+  //
+  // If no <r3st_cam_border> tag is found the dummy event is still synced to the
+  // player (smooth follow, no clamping).  Set camBoundDummyId to 0 to disable.
+
+  let _camBorder = null;   // null until a map with a border tag is loaded
+
+  /** Parse <r3st_cam_border>L,R,T,B</r3st_cam_border> from a note string. */
+  function parseCamBorder(note) {
+    if (!note) return null;
+    const m = note.match(/<r3st_cam_border>([\d.\s,]+)<\/r3st_cam_border>/i);
+    if (!m) return null;
+    const parts = m[1].split(',').map(Number);
+    if (parts.length < 4 || parts.some(isNaN)) return null;
+    return { left: parts[0], right: parts[1], top: parts[2], bottom: parts[3] };
+  }
+
+  // Per-frame hook: sync dummy event position to clamped player position.
+  if (CAM_BOUND_EVENT > 0) {
+    const _origUpdateMain = Scene_Map.prototype.updateMain;
+    Scene_Map.prototype.updateMain = function () {
+      _origUpdateMain.call(this);
+
+      if (!$gameMap || !$gamePlayer) return;
+      const dummy = $gameMap.event(CAM_BOUND_EVENT);
+      if (!dummy) return;
+
+      let clampedX = $gamePlayer._realX;
+      let clampedY = $gamePlayer._realY;
+
+      if (_camBorder) {
+        const mapW = $dataMap.width;
+        const mapH = $dataMap.height;
+        // RPG Maker: X increases east, Y increases south (Y=0 = north edge).
+        clampedX = Math.max(_camBorder.left,
+                   Math.min(mapW - _camBorder.right,  clampedX));
+        clampedY = Math.max(_camBorder.top,
+                   Math.min(mapH - _camBorder.bottom, clampedY));
+      }
+
+      dummy._x     = clampedX;
+      dummy._y     = clampedY;
+      dummy._realX = clampedX;
+      dummy._realY = clampedY;
+    };
+  }
+
   // ── Map load fallback ─────────────────────────────────────────────────────
 
   const _onMapLoaded = Scene_Map.prototype.onMapLoaded;
   Scene_Map.prototype.onMapLoaded = function () {
     _onMapLoaded.apply(this, arguments);
+
+    // Parse per-map camera boundary tag written by the R3ST Blender add-on.
+    _camBorder = parseCamBorder($dataMap?.note || '');
+    if (_camBorder) {
+      console.log(TAG, `Camera border: L=${_camBorder.left} R=${_camBorder.right}`
+                     + ` T=${_camBorder.top} B=${_camBorder.bottom}`);
+    }
+
     setTimeout(() => {
       applyToAll(false);
       applyToAllDoodads();
@@ -441,6 +525,7 @@
     enable,
     disable,
     get isEnabled() { return active; },
+    get camBorder()  { return _camBorder; },
   };
 
   console.log(TAG, 'Ready. Ortho switching:', PARAM_ENABLED ? 'ON' : 'OFF');
