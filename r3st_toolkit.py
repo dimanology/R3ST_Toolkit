@@ -20,7 +20,7 @@ bl_info = {
     "name":        "RMMZ 3D Scene Toolkit (R3ST)",
     "description": "Blender tools for building pre-rendered backgrounds for RPG Maker MZ. Requires the mz3d plugin (purchased separately).",
     "author":      "Claude.ai and Dimanology",
-    "version":     (1, 3, 0),
+    "version":     (0, 4, 0),
     "blender":     (4, 0, 0),
     "location":    "View3D > Sidebar > R3ST",
     "category":    "Game Engine",
@@ -51,6 +51,7 @@ PI = math.pi
 COLLECTION_NAME  = 'Ortho'    # background / foreground geometry
 CAM_COLLECTION   = 'Camera'   # camera rig objects
 PERSP_COLLECTION = 'Persp'    # perspective-rendered objects (characters, NPCs)
+EVENTS_COLLECTION = 'Events'  # tile event markers (Empties)
 PIVOT_NAME       = 'R3ST_Pivot'
 ARM_NAME        = 'R3ST_CameraArm'
 CAM_NAME        = 'R3ST_Camera'
@@ -97,6 +98,54 @@ _SHEET_DEFS = {
     'D':  {'w': 768, 'h': 768,  'cols': 16, 'rows': 16, 'reserved': False},
     'E':  {'w': 768, 'h': 768,  'cols': 16, 'rows': 16, 'reserved': False},
 }
+
+
+# ── Map-qualified object name helpers ────────────────────────────────────────
+#
+# In multi-map setups each Blender scene has its own rig.  Object names in
+# bpy.data.objects are globally unique, so each rig is named after its map:
+#   R3ST_Pivot_Town, R3ST_CameraArm_Town, R3ST_Camera_Town, R3ST_Room_Town
+#
+# Backward-compat: existing .blend files have the bare legacy names
+# (R3ST_Pivot, R3ST_CameraArm, R3ST_Camera, R3ST_Room).  The _get_* getters
+# try the qualified name first, then fall back to the legacy bare name so
+# existing single-scene projects continue to work without rebuilding their rigs.
+
+def _pivot_name(map_name): return f'R3ST_Pivot_{map_name}'
+def _arm_name(map_name):   return f'R3ST_CameraArm_{map_name}'
+def _cam_name(map_name):   return f'R3ST_Camera_{map_name}'
+def _room_name(map_name):  return f'R3ST_Room_{map_name}'
+
+
+def _get_pivot(map_name):
+    obj = bpy.data.objects.get(_pivot_name(map_name))
+    if obj is None:
+        obj = bpy.data.objects.get(PIVOT_NAME)   # legacy fallback
+    return obj
+
+
+def _get_cam(map_name):
+    obj = bpy.data.objects.get(_cam_name(map_name))
+    if obj is None:
+        obj = bpy.data.objects.get(CAM_NAME)     # legacy fallback
+    return obj
+
+
+def _get_room(map_name):
+    obj = bpy.data.objects.get(_room_name(map_name))
+    if obj is None:
+        obj = bpy.data.objects.get(ROOM_NAME)    # legacy fallback
+    return obj
+
+
+def _is_r3st_rig_obj(obj_name):
+    """Return True if obj_name belongs to any R3ST rig (any map, legacy or qualified)."""
+    if obj_name in (PIVOT_NAME, ARM_NAME, CAM_NAME):
+        return True
+    for prefix in ('R3ST_Pivot_', 'R3ST_CameraArm_', 'R3ST_Camera_'):
+        if obj_name.startswith(prefix):
+            return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -156,6 +205,7 @@ def _ensure_scene_collections():
     _ensure_placeholder('_character',  persp_col,     display_type='ARROWS', display_size=0.5)
     # Placeholder: _collision (cube wireframe — shows the expected shape for collision)
     _ensure_placeholder('_collision',  collision_col, display_type='CUBE',   display_size=0.5)
+    get_or_create_collection(EVENTS_COLLECTION)            # Events — tile event markers
 
 
 def add_custom_prop(obj, name, value, mn, mx, desc):
@@ -699,7 +749,7 @@ def _build_mz3d_note(map_name):
         rg    = int(obj.get('r3st_render_group', 1))
         grp   = obj.get('r3st_export_group', '').strip()
         # R3ST_Room is always .obj — never let a stray export_type override that
-        if obj.name == ROOM_NAME:
+        if obj.name == ROOM_NAME or obj.name == _room_name(map_name):
             ext = 'obj'
         else:
             ext = obj.get('r3st_export_type', 'OBJ').lower()
@@ -818,6 +868,184 @@ def _get_scene_bundles():
     return bundles, ungrouped
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TILE EVENTS  — Empties in the 'Events' collection tagged with r3st_event_type.
+#                Structured data lives in the R3ST_EventProps PropertyGroup (per
+#                object).  Exported to data/r3st_events_{map}.json via Export Events.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_EVENT_TYPES = [
+    ('TRANSITION', "Transition", "Map transfer — warp to another map tile"),
+    ('NPC',        "NPC",        "Non-player character spawn marker"),
+    ('ITEM',       "Item",       "Item pickup marker"),
+    ('TRIGGER',    "Trigger",    "Generic region trigger"),
+]
+
+# display_type, object color (rgba float)
+_EVENT_DISPLAY = {
+    'TRANSITION': ('SINGLE_ARROW', (0.20, 0.45, 1.00, 1.0)),   # blue
+    'NPC':        ('ARROWS',       (0.20, 0.80, 0.25, 1.0)),   # green
+    'ITEM':       ('SPHERE',       (1.00, 0.78, 0.10, 1.0)),   # yellow
+    'TRIGGER':    ('CIRCLE',       (0.80, 0.20, 0.85, 1.0)),   # purple
+}
+
+# Panel icon per event type
+_EVENT_ICONS = {
+    'TRANSITION': 'LOOP_FORWARDS',
+    'NPC':        'ARMATURE_DATA',
+    'ITEM':       'OBJECT_DATA',
+    'TRIGGER':    'RADIOBUT_ON',
+}
+
+
+def _tile_to_blender(tx, ty, room_d):
+    """RPG Maker tile (tx, ty) → Blender world-space tile center (x, y, 0).
+    Room bottom-left is at world origin; RPG Maker row 0 is the far/north edge.
+    """
+    return (tx + 0.5, room_d - ty - 0.5, 0.0)
+
+
+def _blender_to_tile(bx, by, room_d):
+    """Blender world position → RPG Maker tile (tx, ty)."""
+    return (int(math.floor(bx)), int(math.floor(room_d - by)))
+
+
+def _snap_to_tile_center(bx, by, room_d):
+    """Snap a Blender position to the nearest tile center."""
+    tx, ty = _blender_to_tile(bx, by, room_d)
+    return _tile_to_blender(tx, ty, room_d)
+
+
+def _apply_event_display(obj, event_type):
+    """Set display type and viewport color for an event empty."""
+    disp_type, color = _EVENT_DISPLAY.get(event_type, ('PLAIN_AXES', (0.5, 0.5, 0.5, 1.0)))
+    obj.empty_display_type = disp_type
+    obj.empty_display_size = 0.4
+    obj.color = color
+
+
+def _auto_event_name(event_type):
+    """Return the first available 'Event_TYPE_NNN' name."""
+    existing = {obj.name for obj in bpy.data.objects}
+    i = 1
+    while True:
+        candidate = f'Event_{event_type}_{i:03d}'
+        if candidate not in existing:
+            return candidate
+        i += 1
+
+
+def _get_event_empties():
+    """Return all event empties from the Events collection."""
+    col = bpy.data.collections.get(EVENTS_COLLECTION)
+    if not col:
+        return []
+    return [obj for obj in col.objects
+            if obj.type == 'EMPTY' and 'r3st_event_type' in obj]
+
+
+# ── Map name lookup ───────────────────────────────────────────────────────────
+_map_name_cache     = {}   # data_dir → {map_id: name}
+_map_name_cache_dir = None # last project_dir used
+
+
+def _refresh_map_name_cache(project_dir):
+    """Read MapInfos.json and rebuild the id→name lookup."""
+    global _map_name_cache, _map_name_cache_dir
+    _map_name_cache = {}
+    _map_name_cache_dir = project_dir
+    if not project_dir:
+        return
+    data_dir = os.path.join(bpy.path.abspath(project_dir), 'data')
+    try:
+        infos = _load_map_infos(data_dir)
+        _map_name_cache = {
+            e['id']: e['name']
+            for e in infos if e and 'id' in e and 'name' in e
+        }
+    except Exception:
+        pass
+
+
+def _get_map_name(project_dir, map_id):
+    """Return 'MapNNN: Name' string, or None if MapInfos can't be read."""
+    if project_dir != _map_name_cache_dir:
+        _refresh_map_name_cache(project_dir)
+    name = _map_name_cache.get(map_id)
+    if name:
+        return f'Map{map_id:03d}: {name}'
+    return None
+
+
+# ── RPG Maker map list cache ──────────────────────────────────────────────────
+#
+# Used by the Map Selection popup to show all maps from MapInfos.json.
+# Each entry: {'id': int, 'name': str}
+# Refreshed manually via "Refresh Map List" button, or auto on popup open
+# if the project_dir has changed.
+
+_rp_map_cache      = []    # list of {'id': int, 'name': str} dicts
+_rp_map_cache_dir  = None  # last project_dir used when cache was built
+
+
+def _refresh_rp_map_cache(project_dir):
+    """Read MapInfos.json and rebuild the ordered map list."""
+    global _rp_map_cache, _rp_map_cache_dir
+    _rp_map_cache     = []
+    _rp_map_cache_dir = project_dir
+    # Also refresh the name lookup cache at the same time
+    _refresh_map_name_cache(project_dir)
+    if not project_dir:
+        return
+    data_dir = os.path.join(bpy.path.abspath(project_dir), 'data')
+    try:
+        infos = _load_map_infos(data_dir)
+        _rp_map_cache = sorted(
+            [e for e in infos if e and e.get('id') and e.get('name')],
+            key=lambda e: e['id']
+        )
+    except Exception:
+        pass
+
+
+def _ensure_rp_map_cache(project_dir):
+    """Refresh cache if project_dir changed since last build."""
+    if project_dir != _rp_map_cache_dir:
+        _refresh_rp_map_cache(project_dir)
+
+
+def _find_scene_for_map_id(map_id):
+    """Return the Blender scene whose map_id property matches, or None."""
+    for scene in bpy.data.scenes:
+        try:
+            if scene.r3st_tileset.map_id == map_id:
+                return scene
+        except Exception:
+            pass
+    return None
+
+
+def _serialize_event(obj):
+    """Serialize an event empty's PropertyGroup fields to a plain dict (for JSON export)."""
+    etype = obj.get('r3st_event_type', 'TRIGGER')
+    ev    = obj.r3st_event
+    if etype == 'TRANSITION':
+        return {
+            'type':      'TRANSITION',
+            'targetMap': ev.trans_map_id,
+            'targetX':   ev.trans_x,
+            'targetY':   ev.trans_y,
+            'dir':       int(ev.trans_dir),
+            'fade':      int(ev.trans_fade),
+        }
+    if etype == 'NPC':
+        return {'type': 'NPC', 'name': ev.npc_name, 'facing': int(ev.npc_facing)}
+    if etype == 'ITEM':
+        return {'type': 'ITEM', 'itemId': ev.item_id}
+    # TRIGGER (default)
+    return {'type': 'TRIGGER', 'id': ev.trigger_id}
+
+
 def _write_anchor_tiles(map_data, map_name):
     """
     Write one anchor tile per auto-tagged render layer into the map data array.
@@ -895,6 +1123,69 @@ def _get_pkg_items(self, context):
 # ══════════════════════════════════════════════════════════════════════════════
 # PROPERTY GROUPS
 # ══════════════════════════════════════════════════════════════════════════════
+
+class R3ST_EventProps(PropertyGroup):
+    """Structured event data — registered on Object, only meaningful on event empties."""
+
+    # ── Transition ───────────────────────────────────────────────────────────
+    trans_map_id: IntProperty(
+        name="Map ID", default=1, min=1, max=999,
+        description="ID of the destination map — must match the number in MapXXX.json")
+    trans_x: IntProperty(
+        name="Tile X", default=0, min=0, max=255,
+        description="Destination tile column on the target map")
+    trans_y: IntProperty(
+        name="Tile Y", default=0, min=0, max=255,
+        description="Destination tile row on the target map")
+    trans_dir: EnumProperty(
+        name="Face On Arrive",
+        description="Direction the player character faces after arriving",
+        items=[
+            ('2', "Down ↓",  "Face down — toward the camera (south)"),
+            ('4', "Left ←",  "Face left (west)"),
+            ('6', "Right →", "Face right (east)"),
+            ('8', "Up ↑",    "Face up — away from the camera (north)"),
+        ],
+        default='2',
+    )
+    trans_fade: EnumProperty(
+        name="Screen Fade",
+        description="What happens to the screen during the map transfer",
+        items=[
+            ('0', "Black", "Screen fades to black, then fades back in on arrival"),
+            ('1', "White", "Screen flashes to white, then fades back in on arrival"),
+            ('2', "Instant", "No fade — map swaps instantly with no transition"),
+        ],
+        default='0',
+    )
+
+    # ── NPC ──────────────────────────────────────────────────────────────────
+    npc_name: StringProperty(
+        name="Name", default="NPC",
+        description="Display name of the NPC")
+    npc_facing: EnumProperty(
+        name="Facing",
+        description="Direction the NPC faces when spawned",
+        items=[
+            ('2', "Down ↓",  ""),
+            ('4', "Left ←",  ""),
+            ('6', "Right →", ""),
+            ('8', "Up ↑",    ""),
+        ],
+        default='2',
+    )
+
+    # ── Item ─────────────────────────────────────────────────────────────────
+    item_id: IntProperty(
+        name="Item ID", default=1, min=1, max=9999,
+        description="RPG Maker item database ID (Items tab in the database)")
+
+    # ── Trigger ───────────────────────────────────────────────────────────────
+    trigger_id: StringProperty(
+        name="Trigger ID", default="trigger_1",
+        description="String identifier read by RPG Maker conditional branches "
+                    "to check whether the player is on this trigger tile")
+
 
 class R3ST_SetupProps(PropertyGroup):
     """Global project settings — set once, used everywhere."""
@@ -1003,9 +1294,10 @@ class R3ST_SetupProps(PropertyGroup):
     active_tab: EnumProperty(
         name="Tab",
         items=[
-            ('SCENE',    '', "1 · Setup",    'SCENE_DATA',      0),
-            ('PREVIEW',  '', "2 · Camera",   'CAMERA_DATA',     1),
-            ('GEOMETRY', '', "3 · Geometry", 'OBJECT_DATAMODE', 2),
+            ('SCENE',    '', "1 · Setup",    'SCENE_DATA',        0),
+            ('PREVIEW',  '', "2 · Camera",   'CAMERA_DATA',       1),
+            ('GEOMETRY', '', "3 · Geometry", 'OBJECT_DATAMODE',   2),
+            ('EVENTS',   '', "4 · Events",   'OUTLINER_OB_EMPTY', 3),
         ],
         default='SCENE',
     )
@@ -1026,6 +1318,15 @@ class R3ST_TilesetProps(PropertyGroup):
         name="Map Name", default="Map_01",
         description="Name for tileset PNGs and the RPG Maker map entry "
                     "(spaces allowed — R3ST_{name}_B.png)")
+
+    map_id: IntProperty(
+        name="Map ID",
+        default=1,
+        min=1,
+        max=999,
+        description="RPG Maker map number — links this Blender scene to Map001, Map002, etc. "
+                    "Must match the number in your RPG Maker project's MapInfos.json"
+    )
 
     # ── Geometry tag ──────────────────────────────────────────────────────────
     tag_map:   EnumProperty(
@@ -1120,17 +1421,22 @@ class R3ST_OT_setup_rig(Operator):
 
     def execute(self, context):
         s = context.scene.r3st_setup
+        t = context.scene.r3st_tileset
+        mn = t.map_name.strip() or 'Map'
 
-        cam_data = bpy.data.cameras.get(CAM_NAME)
+        # Remove any existing rig for this map (qualified names first, then legacy)
+        cam_data = bpy.data.cameras.get(_cam_name(mn)) or bpy.data.cameras.get(CAM_NAME)
         if cam_data:
             bpy.data.cameras.remove(cam_data)
+        remove_obj(_pivot_name(mn)); remove_obj(_arm_name(mn)); remove_obj(_cam_name(mn))
+        # Also clean up legacy bare names on first run (idempotent for new scenes)
         remove_obj(PIVOT_NAME); remove_obj(ARM_NAME); remove_obj(CAM_NAME)
 
         _ensure_scene_collections()
         col = get_or_create_collection(CAM_COLLECTION)
 
         # Pivot — holds all camera sliders as custom properties
-        pivot = bpy.data.objects.new(PIVOT_NAME, None)
+        pivot = bpy.data.objects.new(_pivot_name(mn), None)
         pivot.empty_display_type = 'SPHERE'
         pivot.empty_display_size = 0.25
         link_to_collection(pivot, col)
@@ -1147,7 +1453,7 @@ class R3ST_OT_setup_rig(Operator):
                         'Camera roll in degrees  (0 = level)')
 
         # Camera arm — carries position drivers + Track To constraint
-        arm = bpy.data.objects.new(ARM_NAME, None)
+        arm = bpy.data.objects.new(_arm_name(mn), None)
         arm.empty_display_type = 'ARROWS'
         arm.empty_display_size = 0.1
         link_to_collection(arm, col)
@@ -1165,11 +1471,11 @@ class R3ST_OT_setup_rig(Operator):
         add_driver(arm,'location',2,pivot,VARS,f'pz - dist*sin({PR})')
 
         # Camera — parents to arm, only adds roll on top
-        cam_data = bpy.data.cameras.new(CAM_NAME)
+        cam_data = bpy.data.cameras.new(_cam_name(mn))
         cam_data.lens_unit = 'MILLIMETERS'
         cam_data.sensor_fit = 'VERTICAL'
         cam_data.sensor_height = SENSOR_H
-        cam_obj = bpy.data.objects.new(CAM_NAME, cam_data)
+        cam_obj = bpy.data.objects.new(_cam_name(mn), cam_data)
         link_to_collection(cam_obj, col)
         cam_obj.parent = arm
         cam_obj.rotation_mode = 'XYZ'
@@ -1195,7 +1501,7 @@ class R3ST_OT_setup_rig(Operator):
                         space.region_3d.view_perspective = 'CAMERA'
                 break
 
-        self.report({'INFO'}, f"Rig created  ·  collections: {CAM_COLLECTION}, {PERSP_COLLECTION}, Ortho, Collision")
+        self.report({'INFO'}, f"Rig created for map '{mn}'  ·  collections: {CAM_COLLECTION}, {PERSP_COLLECTION}, Ortho, Collision")
         return {'FINISHED'}
 
 
@@ -1236,20 +1542,26 @@ class R3ST_OT_build_demo_room(Operator):
     def execute(self, context):
         s   = context.scene.r3st_setup
         r   = context.scene.r3st_room
+        t   = context.scene.r3st_tileset
         col = get_or_create_collection(COLLECTION_NAME)
+        mn  = t.map_name.strip() or 'Map'
+        rn  = _room_name(mn)   # e.g. R3ST_Room_Town
 
         if not s.project_dir:
             self.report({'ERROR'}, "Set the Project Root in Scene Setup first.")
             return {'CANCELLED'}
         out_dir = os.path.join(bpy.path.abspath(s.project_dir), '_R3ST')
 
+        # Remove old room objects — both qualified and legacy
+        remove_obj(rn)
         remove_obj(ROOM_NAME)
         for ci in range(r.room_w):
             for ri in range(r.room_d):
                 remove_mat(f'R3ST_Floor_{tile_image_name(ci, ri)}')
+        remove_mat(rn + '_WallNS'); remove_mat(rn + '_WallEW')
         remove_mat(ROOM_NAME + '_WallNS'); remove_mat(ROOM_NAME + '_WallEW')
 
-        mesh = bpy.data.meshes.new(ROOM_NAME)
+        mesh = bpy.data.meshes.new(rn)
         bm   = bmesh.new()
         uv_layer = bm.loops.layers.uv.new('UVMap')
 
@@ -1285,7 +1597,7 @@ class R3ST_OT_build_demo_room(Operator):
 
         # Walls — vertex order is reversed so normals point INWARD (into the room).
         # South wall  (y = 0, normal points +y)
-        slot_ns = get_or_add_slot(ROOM_NAME + '_WallNS')
+        slot_ns = get_or_add_slot(rn + '_WallNS')
         for ci in range(r.room_w):
             x0=float(ci); x1=x0+1
             v0=bm.verts.new((x0,0,0)); v1=bm.verts.new((x1,0,0))
@@ -1298,7 +1610,7 @@ class R3ST_OT_build_demo_room(Operator):
             v2=bm.verts.new((x0,d,h)); v3=bm.verts.new((x1,d,h))
             bm.faces.new([v3,v2,v1,v0]).material_index = slot_ns
 
-        slot_ew = get_or_add_slot(ROOM_NAME + '_WallEW')
+        slot_ew = get_or_add_slot(rn + '_WallEW')
         # West wall  (x = 0, normal points +x)
         for ri in range(r.room_d):
             y0=float(ri); y1=y0+1
@@ -1313,15 +1625,15 @@ class R3ST_OT_build_demo_room(Operator):
             bm.faces.new([v3,v2,v1,v0]).material_index = slot_ew
 
         bm.to_mesh(mesh); bm.free()
-        room_obj = bpy.data.objects.new(ROOM_NAME, mesh)
+        room_obj = bpy.data.objects.new(rn, mesh)
         link_to_collection(room_obj, col)
 
         opacity = s.tile_opacity
         for mat_name, _ in sorted(mat_slots.items(), key=lambda x: x[1]):
-            if mat_name == ROOM_NAME + '_WallNS':
+            if mat_name == rn + '_WallNS':
                 room_obj.data.materials.append(
                     _solid_emit_mat(mat_name, (0.08,0.30,0.20,1.0), alpha=opacity))
-            elif mat_name == ROOM_NAME + '_WallEW':
+            elif mat_name == rn + '_WallEW':
                 room_obj.data.materials.append(
                     _solid_emit_mat(mat_name, (0.40,0.10,0.15,1.0), alpha=opacity))
             else:
@@ -1358,7 +1670,6 @@ class R3ST_OT_build_demo_room(Operator):
         cube.data.materials.append(cmat)
 
         # ── Auto-tag room as A5 0,0 OBJ ──────────────────────────────────────
-        t = context.scene.r3st_tileset
         room_obj['r3st_sheet']        = 'A5'
         room_obj['r3st_col']          = 0
         room_obj['r3st_row']          = 0
@@ -1438,16 +1749,18 @@ class R3ST_OT_export_camera(Operator):
 
     def execute(self, context):
         e   = context.scene.r3st_export
+        t   = context.scene.r3st_tileset
+        mn  = t.map_name.strip() or 'Map'
         dec = e.decimals   # precision — not exposed in UI, defaults to 2
 
-        pivot = bpy.data.objects.get(PIVOT_NAME)
-        cam   = bpy.data.objects.get(CAM_NAME)
+        pivot = _get_pivot(mn)
+        cam   = _get_cam(mn)
 
         if pivot is None:
-            self.report({'ERROR'}, f'"{PIVOT_NAME}" not found — run Create Rig first.')
+            self.report({'ERROR'}, "Camera pivot not found — run Create / Rebuild Rig first.")
             return {'CANCELLED'}
         if cam is None:
-            self.report({'ERROR'}, f'"{CAM_NAME}" not found — run Create Rig first.')
+            self.report({'ERROR'}, "Camera not found — run Create / Rebuild Rig first.")
             return {'CANCELLED'}
 
         yaw    = round(pivot.get('yaw',   0.0),  dec)
@@ -1950,9 +2263,9 @@ class R3ST_OT_prepare_export(Operator):
         r = context.scene.r3st_room
         t = context.scene.r3st_tileset
 
-        room_obj = bpy.data.objects.get(ROOM_NAME)
+        room_obj = _get_room(t.map_name.strip() or 'Map')
         if room_obj is None:
-            self.report({'ERROR'}, f'"{ROOM_NAME}" not found — build the room first.')
+            self.report({'ERROR'}, "Room mesh not found — run 'Build Room Mesh' first.")
             return {'CANCELLED'}
 
         if not s.project_dir:
@@ -2102,19 +2415,22 @@ class R3ST_OT_export_level(Operator):
         exported = []
 
         # ── 1. R3ST_Room → always .obj ────────────────────────────────────────
-        room_obj = bpy.data.objects.get(ROOM_NAME)
+        t        = context.scene.r3st_tileset
+        mn       = t.map_name.strip() or 'Map'
+        room_obj = _get_room(mn)
         if room_obj:
             out_path = os.path.join(models_dir, room_obj.name + '.obj')
             self._export_obj(context, [room_obj], out_path)
             exported.append(room_obj.name + '.obj')
             print(f'[R3ST] Room   → {out_path}')
         else:
-            self.report({'WARNING'}, f'"{ROOM_NAME}" not found — skipping room export.')
+            self.report({'WARNING'}, "Room mesh not found — skipping room export.")
 
         # ── 2. Collect export groups from tagged scene objects ─────────────────
+        room_names = {ROOM_NAME, _room_name(mn)}
         groups = {}   # (group_name, export_type) → [obj, ...]
         for obj in bpy.data.objects:
-            if obj.type != 'MESH' or obj.name == ROOM_NAME:
+            if obj.type != 'MESH' or obj.name in room_names:
                 continue
             grp = obj.get('r3st_export_group', '').strip()
             ext = obj.get('r3st_export_type', 'GLB')
@@ -2231,7 +2547,8 @@ class R3ST_OT_cam_mem_save(Operator):
     slot: IntProperty(default=1, min=1, max=4, options={'SKIP_SAVE'})
 
     def execute(self, context):
-        pivot = bpy.data.objects.get(PIVOT_NAME)
+        mn    = (context.scene.r3st_tileset.map_name.strip() or 'Map')
+        pivot = _get_pivot(mn)
         if pivot is None:
             self.report({'ERROR'}, "Camera rig not found — create it first.")
             return {'CANCELLED'}
@@ -2254,7 +2571,8 @@ class R3ST_OT_cam_mem_restore(Operator):
     slot: IntProperty(default=1, min=1, max=4, options={'SKIP_SAVE'})
 
     def execute(self, context):
-        pivot = bpy.data.objects.get(PIVOT_NAME)
+        mn    = (context.scene.r3st_tileset.map_name.strip() or 'Map')
+        pivot = _get_pivot(mn)
         if pivot is None:
             self.report({'ERROR'}, "Camera rig not found — create it first.")
             return {'CANCELLED'}
@@ -2312,6 +2630,37 @@ class R3ST_PT_main(Panel):
         r = context.scene.r3st_room
         t = context.scene.r3st_tileset
 
+        # ── Maps ──────────────────────────────────────────────────────────────
+        maps_box = layout.box()
+        maps_hdr = maps_box.row()
+        maps_hdr.label(text="Maps", icon='SCENE_DATA')
+        maps_hdr.operator("r3st.refresh_rp_maps", text="", icon='FILE_REFRESH')
+
+        # Current scene status
+        cur_id   = t.map_id
+        cur_name = t.map_name.strip() or '—'
+        archived = bool(context.scene.get('r3st_archived', False))
+
+        ms = maps_box.column(align=True)
+        # Map picker button — shows current map label
+        rp_entry  = next((e for e in _rp_map_cache if e['id'] == cur_id), None)
+        btn_label = f"Map{cur_id:03d}: {rp_entry['name']}" if rp_entry else f"Map{cur_id:03d}: {cur_name}"
+        if archived:
+            btn_label = f"[Archived]  {btn_label}"
+        ms.operator("r3st.pick_map", text=btn_label, icon='DOWNARROW_HLT')
+        ms.separator(factor=0.3)
+
+        # Action row: new / archive / restore / delete
+        act_row = ms.row(align=True)
+        act_row.operator("r3st.create_map",  text="New",     icon='ADD')
+        if archived:
+            act_row.operator("r3st.restore_map", text="Restore", icon='CHECKMARK')
+        else:
+            act_row.operator("r3st.archive_map", text="Archive", icon='FOLDER_REDIRECT')
+        act_row.operator("r3st.delete_map",  text="Delete",  icon='TRASH')
+
+        layout.separator(factor=1.0)
+
         # ── Project settings ──────────────────────────────────────────────────
         setup_box = layout.box()
         # Inline Advanced toggle (matches Geometry tab pattern)
@@ -2337,7 +2686,10 @@ class R3ST_PT_main(Panel):
         sheets_box = layout.box()
         sheets_box.label(text="Tileset Sheets", icon='IMAGE_DATA')
         gc = sheets_box.column(align=True)
-        gc.prop(t, 'map_name')
+        id_row = gc.row(align=True)
+        id_row.prop(t, 'map_id',   text="Map ID")
+        id_row.prop(t, 'map_name', text="Name")
+        gc.separator(factor=0.3)
         # Sheet preview — show what will be generated
         if s.scene_advanced:
             sheets_list = []
@@ -2362,9 +2714,9 @@ class R3ST_PT_main(Panel):
 
         layout.separator(factor=1.0)
 
-        # ── Room dimensions ───────────────────────────────────────────────────
+        # ── Map dimensions ────────────────────────────────────────────────────
         dim_box = layout.box()
-        dim_box.label(text="Room Size  (= RPG Maker map tiles)", icon='GRID')
+        dim_box.label(text="Map Size  (= RPG Maker map tiles)", icon='GRID')
         dc = dim_box.column(align=True)
         dr = dc.row(align=True)
         dr.prop(r, 'room_w', text="W (X)")
@@ -2376,9 +2728,9 @@ class R3ST_PT_main(Panel):
 
         layout.separator(factor=1.0)
 
-        # ── Room Generation ───────────────────────────────────────────────────
+        # ── Map Generation ────────────────────────────────────────────────────
         act_box = layout.box()
-        act_box.label(text="Room Generation", icon='MESH_GRID')
+        act_box.label(text="Map Generation", icon='MESH_GRID')
         ac = act_box.column(align=True)
         ac.label(text="Run these steps in order:", icon='INFO')
         ac.separator(factor=0.5)
@@ -2524,8 +2876,9 @@ class R3ST_PT_main(Panel):
         rig_box.label(text="Camera Rig", icon='CAMERA_DATA')
         rig_box.operator("r3st.setup_rig", icon='CAMERA_DATA')
         rig_box.separator(factor=0.5)
-        pivot   = bpy.data.objects.get(PIVOT_NAME)
-        cam_obj = bpy.data.objects.get(CAM_NAME)
+        mn      = context.scene.r3st_tileset.map_name.strip() or 'Map'
+        pivot   = _get_pivot(mn)
+        cam_obj = _get_cam(mn)
         if pivot and cam_obj:
             live_box = rig_box.box()
             live_box.label(text="Live Camera Controls", icon='DRIVER')
@@ -2565,7 +2918,7 @@ class R3ST_PT_main(Panel):
         cfg_box.label(
             text=f"Output:  {int(s.res_x * pct_val)} × {int(s.res_y * pct_val)} px",
             icon='INFO')
-        rig_ok = bool(bpy.data.objects.get(CAM_NAME))
+        rig_ok = bool(_get_cam(mn))
         col_ok = bool(bpy.data.collections.get(PERSP_COLLECTION))
         # Only show the status box when there's an error to report
         if not rig_ok or not col_ok:
@@ -2678,6 +3031,110 @@ class R3ST_PT_main(Panel):
             bc.label(text="Exports to map JSON — read by r3st_toolkit.js",
                      icon='EXPORT')
 
+    @staticmethod
+    def _draw_events(context, layout):
+        """Tab 4 — Events: place and export RPG Maker event markers."""
+        s      = context.scene.r3st_setup
+        room_d = context.scene.r3st_room.room_d
+
+        # ── Cursor tile readout ────────────────────────────────────────────────
+        cursor = context.scene.cursor.location
+        cx, cy = _blender_to_tile(cursor.x, cursor.y, room_d)
+        cur_box = layout.box()
+        cur_row = cur_box.row()
+        cur_row.label(text=f"Cursor:  col {cx},  row {cy}", icon='CURSOR')
+
+        # ── Add Event ──────────────────────────────────────────────────────────
+        add_box = layout.box()
+        add_box.label(text="Add at cursor  ·  snaps to tile center", icon='MARKER')
+        ac = add_box.column(align=True)
+        for code, label, _ in _EVENT_TYPES:
+            op = ac.operator("r3st.add_event", text=label,
+                             icon=_EVENT_ICONS.get(code, 'DOT'))
+            op.event_type = code
+
+        # ── Selected event edit ────────────────────────────────────────────────
+        obj      = context.active_object
+        is_event = (obj and obj.type == 'EMPTY' and 'r3st_event_type' in obj)
+
+        layout.separator(factor=1.0)
+        sel_box = layout.box()
+        if is_event:
+            ev    = obj.r3st_event
+            etype = obj.get('r3st_event_type', '?')
+
+            sel_box.label(text=f"Selected:  {obj.name}",
+                          icon=_EVENT_ICONS.get(etype, 'DOT'))
+            ec = sel_box.column(align=True)
+
+            # Tile position (read-only label)
+            tx, ty = _blender_to_tile(obj.location.x, obj.location.y, room_d)
+            ec.label(text=f"  Tile:  col {tx},  row {ty}", icon='MESH_GRID')
+            ec.separator(factor=0.5)
+
+            # Event type quick-switch (depress = current type)
+            ec.label(text="Event type:", icon='NONE')
+            type_row = ec.row(align=True)
+            for code, lbl, _ in _EVENT_TYPES:
+                op = type_row.operator("r3st.set_event_type", text=lbl,
+                                       depress=(code == etype))
+                op.event_type = code
+            ec.separator(factor=0.8)
+
+            # Structured fields per type
+            if etype == 'TRANSITION':
+                map_label = _get_map_name(s.project_dir, ev.trans_map_id)
+                if map_label:
+                    ec.label(text=f"  → {map_label}", icon='CHECKMARK')
+                else:
+                    ec.label(text="  Map name unknown — check Map ID", icon='INFO')
+                ec.prop(ev, 'trans_map_id', text="Map ID")
+                ec.separator(factor=0.4)
+                xy = ec.row(align=True)
+                xy.prop(ev, 'trans_x', text="Arrive X")
+                xy.prop(ev, 'trans_y', text="Arrive Y")
+                ec.separator(factor=0.4)
+                ec.prop(ev, 'trans_dir',  text="Face On Arrive")
+                ec.prop(ev, 'trans_fade', text="Screen Fade")
+
+            elif etype == 'NPC':
+                ec.prop(ev, 'npc_name',   text="Name")
+                ec.prop(ev, 'npc_facing', text="Facing")
+
+            elif etype == 'ITEM':
+                ec.prop(ev, 'item_id', text="Item ID")
+
+            elif etype == 'TRIGGER':
+                ec.prop(ev, 'trigger_id', text="Trigger ID")
+
+        else:
+            sel_box.label(text="Select an event empty to edit it", icon='INFO')
+
+        # ── Scene events summary ───────────────────────────────────────────────
+        layout.separator(factor=1.0)
+        all_events = _get_event_empties()
+        sum_box = layout.box()
+        sum_box.label(text=f"Scene Events  ·  {len(all_events)} total", icon='PACKAGE')
+        if all_events:
+            counts = {}
+            for ev_obj in all_events:
+                et = ev_obj.get('r3st_event_type', '?')
+                counts[et] = counts.get(et, 0) + 1
+            sc = sum_box.column(align=True)
+            for et, count in sorted(counts.items()):
+                sc.label(text=f"  {et}  ·  {count}",
+                         icon=_EVENT_ICONS.get(et, 'DOT'))
+        else:
+            sum_box.label(text="  No events yet — add markers above", icon='INFO')
+
+        # ── Operations ────────────────────────────────────────────────────────
+        layout.separator(factor=1.0)
+        ops_box = layout.box()
+        ops_box.label(text="Operations", icon='SETTINGS')
+        ops_box.operator("r3st.snap_events_to_grid", icon='SNAP_GRID')
+        ops_box.operator("r3st.refresh_map_cache",   icon='FILE_REFRESH')
+        ops_box.operator("r3st.export_events",       icon='EXPORT')
+
     # ── Main draw ─────────────────────────────────────────────────────────────
 
     def draw(self, context):
@@ -2699,12 +3156,14 @@ class R3ST_PT_main(Panel):
         col_tabs.prop_enum(s, 'active_tab', 'SCENE',    text='', icon='SCENE_DATA')
         col_tabs.prop_enum(s, 'active_tab', 'PREVIEW',  text='', icon='CAMERA_DATA')
         col_tabs.prop_enum(s, 'active_tab', 'GEOMETRY', text='', icon='OBJECT_DATAMODE')
+        col_tabs.prop_enum(s, 'active_tab', 'EVENTS',   text='', icon='OUTLINER_OB_EMPTY')
 
         col_content = split.column()
         tab = s.active_tab
         if   tab == 'SCENE':    self._draw_scene(context,    col_content)
         elif tab == 'PREVIEW':  self._draw_preview(context,  col_content)
         elif tab == 'GEOMETRY': self._draw_geometry(context, col_content)
+        elif tab == 'EVENTS':   self._draw_events(context,   col_content)
 
 
 # ── Sub-panel 1: Scene ───────────────────────────────────────────────────────
@@ -2779,16 +3238,17 @@ class R3ST_OT_setup_preview(Operator):
 
     def execute(self, context):
         s              = context.scene.r3st_setup
+        mn             = context.scene.r3st_tileset.map_name.strip() or 'Map'
         ok = True
 
-        if not bpy.data.objects.get(PIVOT_NAME):
+        if not _get_pivot(mn):
             self.report({'ERROR'},
                         "Camera rig not found — run 'Create / Rebuild Rig' first.")
             ok = False
 
-        if not bpy.data.objects.get(CAM_NAME):
+        if not _get_cam(mn):
             self.report({'ERROR'},
-                        f"'{CAM_NAME}' not found — run 'Create / Rebuild Rig' first.")
+                        "Camera not found — run 'Create / Rebuild Rig' first.")
             ok = False
 
         if not bpy.data.collections.get(PERSP_COLLECTION):
@@ -3084,11 +3544,12 @@ class R3ST_OT_render_preview(Operator):
 
         scene          = context.scene
         s              = scene.r3st_setup
+        _mn_rp         = scene.r3st_tileset.map_name.strip() or 'Map'
 
-        cam_obj = bpy.data.objects.get(CAM_NAME)
+        cam_obj = _get_cam(_mn_rp)
         if not cam_obj:
             self.report({'ERROR'},
-                        f"'{CAM_NAME}' not found — run 'Create / Rebuild Rig' first.")
+                        "Camera not found — run 'Create / Rebuild Rig' first.")
             return {'CANCELLED'}
 
         persp_col = bpy.data.collections.get(PERSP_COLLECTION)
@@ -3274,6 +3735,8 @@ _r3st_continuous = {
 }
 
 
+# Legacy bare rig names (single-scene setups) — used in depsgraph skip logic.
+# Multi-scene rigs are caught by _is_r3st_rig_obj() prefix check.
 _R3ST_RIG_NAMES = frozenset((PIVOT_NAME, ARM_NAME, CAM_NAME))
 
 # ── Walk Test state ───────────────────────────────────────────────────────────
@@ -3471,7 +3934,11 @@ def _draw_cam_boundary():
     """
     try:
         scene = bpy.context.scene
+        # Guard: new empty scenes (e.g. just created via bpy.ops.scene.new) have
+        # the r3st_setup PointerProperty but no project_dir set — skip safely.
         s = scene.r3st_setup
+        if not s.project_dir:
+            return
         if not s.cam_bound_enabled:
             return
 
@@ -3505,6 +3972,79 @@ def _draw_cam_boundary():
         shader.bind()
         shader.uniform_float('color', (0.0, 0.85, 1.0, 0.9))   # bright cyan
         batch.draw(shader)
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set('NONE')
+
+    except Exception:
+        pass   # never crash the viewport
+
+
+_r3st_events_handler = None
+
+
+def _draw_event_tiles():
+    """
+    SpaceView3D POST_VIEW draw callback.
+    Draws a colored 1×1 tile outline for every event empty in the Events collection.
+    The active / selected empty gets a thicker, fully opaque border.
+    Always visible — not limited to the Events tab.
+
+    Tile corners (for tile tx, ty with room depth room_d):
+        x_min = tx,          x_max = tx + 1
+        y_min = room_d-ty-1, y_max = room_d-ty
+    which is equivalent to center ± 0.5 from _tile_to_blender().
+    """
+    try:
+        # Guard: skip if scene has no R3ST project configured (e.g. brand-new scene)
+        if not bpy.context.scene.r3st_setup.project_dir:
+            return
+
+        col = bpy.data.collections.get(EVENTS_COLLECTION)
+        if not col:
+            return
+
+        events = [obj for obj in col.objects
+                  if obj.type == 'EMPTY' and 'r3st_event_type' in obj]
+        if not events:
+            return
+
+        room_d = float(bpy.context.scene.r3st_room.room_d)
+        try:
+            active = bpy.context.active_object
+        except Exception:
+            active = None
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        z = 0.03   # float slightly above cam-boundary (0.02) to avoid z-fighting
+
+        for obj in events:
+            etype = obj.get('r3st_event_type', 'TRIGGER')
+            _, base_color = _EVENT_DISPLAY.get(etype, ('PLAIN_AXES', (0.5, 0.5, 0.5, 1.0)))
+            r, g, b, _ = base_color
+
+            # Snap to tile then compute corners
+            tx, ty = _blender_to_tile(obj.location.x, obj.location.y, room_d)
+            cx, cy, _ = _tile_to_blender(tx, ty, room_d)
+            x_min, x_max = cx - 0.5, cx + 0.5
+            y_min, y_max = cy - 0.5, cy + 0.5
+
+            is_active = (obj == active)
+            alpha  = 1.0 if is_active else 0.65
+            lw     = 3.0 if is_active else 1.5
+
+            coords = [
+                (x_min, y_min, z), (x_max, y_min, z),   # south edge
+                (x_max, y_min, z), (x_max, y_max, z),   # east edge
+                (x_max, y_max, z), (x_min, y_max, z),   # north edge
+                (x_min, y_max, z), (x_min, y_min, z),   # west edge
+            ]
+            batch = batch_for_shader(shader, 'LINES', {'pos': coords})
+            gpu.state.line_width_set(lw)
+            shader.bind()
+            shader.uniform_float('color', (r, g, b, alpha))
+            batch.draw(shader)
+
         gpu.state.line_width_set(1.0)
         gpu.state.blend_set('NONE')
 
@@ -3552,7 +4092,11 @@ def _r3st_walk_timer():
         speed = 0.5
 
     # Camera-relative forward / right vectors derived from pivot yaw
-    pivot   = bpy.data.objects.get(PIVOT_NAME)
+    try:
+        _walk_mn = bpy.context.scene.r3st_tileset.map_name.strip() or 'Map'
+    except Exception:
+        _walk_mn = 'Map'
+    pivot   = _get_pivot(_walk_mn)
     yaw_deg = float(pivot.get('yaw', 0.0)) if pivot else 0.0
     yaw_rad = yaw_deg * PI / 180.0
     #
@@ -3624,7 +4168,114 @@ def _r3st_walk_timer():
             _r3st_continuous['dirty_pass2'] = True
             _r3st_continuous['dirty']       = True
 
+    # ── Check for TRANSITION event tiles ─────────────────────────────────────
+    # If the character is standing on a TRANSITION event, stop the walk timer
+    # and schedule a deferred scene switch (can't switch scenes from inside a
+    # running modal / timer — must do it one tick later).
+    try:
+        scene   = bpy.context.scene
+        room_d  = float(scene.r3st_room.room_d)
+        pending = _check_transition_event(char, room_d)
+        if pending:
+            _r3st_walk['pending_scene'] = pending
+            _r3st_walk['active']        = False
+            _r3st_walk['keys_held']     = set()
+            if not bpy.app.timers.is_registered(_r3st_scene_transition_timer):
+                bpy.app.timers.register(_r3st_scene_transition_timer,
+                                        first_interval=0.1)
+            return None   # stop walk timer
+    except Exception:
+        pass
+
     return 0.05   # reschedule at 20 fps
+
+
+# ── Walk-between-maps helpers ─────────────────────────────────────────────────
+
+def _check_transition_event(char, room_d):
+    """
+    Check whether the character is standing on a TRANSITION event tile.
+    Returns a dict {'map_id': int, 'x': int, 'y': int} or None.
+    """
+    try:
+        col = bpy.data.collections.get(EVENTS_COLLECTION)
+        if not col:
+            return None
+        tx, ty = _blender_to_tile(char.location.x, char.location.y, room_d)
+        for obj in col.objects:
+            if obj.type != 'EMPTY' or obj.get('r3st_event_type') != 'TRANSITION':
+                continue
+            etx, ety = _blender_to_tile(obj.location.x, obj.location.y, room_d)
+            if etx == tx and ety == ty:
+                ev = obj.r3st_event
+                return {
+                    'map_id': ev.trans_map_id,
+                    'x':      ev.trans_x,
+                    'y':      ev.trans_y,
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _r3st_scene_transition_timer():
+    """
+    One-shot timer (0.1 s delay) that fires after the walk timer stops.
+    Switches the Blender scene to the target map and teleports the character
+    to the arrival tile.  Also re-starts Walk Mode in the new scene.
+
+    Scene switches from inside a running modal/timer are unsafe in Blender —
+    this deferred approach (timer → stop → new timer) avoids the crash.
+    Note: after arrival the walk modal is gone; the user presses "Start Walk"
+    again in the new scene.  (Automatic modal re-invoke is a v0.5 feature.)
+    """
+    pending = _r3st_walk.pop('pending_scene', None)
+    if not pending:
+        return None   # one-shot, don't repeat
+
+    target_id = pending['map_id']
+    arr_x     = pending['x']
+    arr_y     = pending['y']
+
+    target = _find_scene_for_map_id(target_id)
+    if not target:
+        print(f'[R3ST Walk] No Blender scene found for map_id={target_id}.')
+        return None
+
+    # Switch scene
+    try:
+        bpy.context.window.scene = target
+    except Exception as ex:
+        print(f'[R3ST Walk] Scene switch failed: {ex}')
+        return None
+
+    # Teleport character to arrival tile in the new scene
+    try:
+        new_room_d = float(target.r3st_room.room_d)
+        new_mn     = target.r3st_tileset.map_name.strip() or 'Map'
+        new_pivot  = _get_pivot(new_mn)
+        char       = _find_walk_character()
+
+        if char and new_pivot:
+            ax, ay, _ = _tile_to_blender(arr_x, arr_y, new_room_d)
+            char.location.x       = ax
+            char.location.y       = ay
+            new_pivot.location.x  = ax
+            new_pivot.location.y  = ay
+
+        # Restart walk mode (timer only — user re-presses the button for the modal)
+        if char:
+            _r3st_walk['char_name'] = char.name
+            _r3st_walk['active']    = True
+            _r3st_walk['keys_held'] = set()
+            if not bpy.app.timers.is_registered(_r3st_walk_timer):
+                bpy.app.timers.register(_r3st_walk_timer, first_interval=0.05)
+
+        print(f'[R3ST Walk] Arrived at Map{target_id:03d} tile ({arr_x},{arr_y})')
+    except Exception as ex:
+        print(f'[R3ST Walk] Arrival setup failed: {ex}')
+
+    return None   # one-shot, don't repeat
 
 
 def _r3st_depsgraph_handler(scene, depsgraph):
@@ -3652,8 +4303,8 @@ def _r3st_depsgraph_handler(scene, depsgraph):
 
     for update in depsgraph.updates:
         id_data = update.id
-        # Skip the R3ST camera rig — drivers fire on every navigation action.
-        if isinstance(id_data, bpy.types.Object) and id_data.name in _R3ST_RIG_NAMES:
+        # Skip R3ST camera rig objects — drivers fire on every navigation action.
+        if isinstance(id_data, bpy.types.Object) and _is_r3st_rig_obj(id_data.name):
             continue
         # Skip Scene-level — fires on our own render-state mutations.
         if isinstance(id_data, bpy.types.Scene):
@@ -4001,6 +4652,444 @@ class R3ST_OT_open_tile_picker(Operator):
         return {'FINISHED'}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# TILE EVENT OPERATORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class R3ST_OT_add_event(Operator):
+    bl_idname      = "r3st.add_event"
+    bl_label       = "Add Event"
+    bl_description = "Place a new event marker empty at the 3D cursor (snapped to tile center)"
+
+    event_type: StringProperty(default='TRANSITION', options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        room_d = context.scene.r3st_room.room_d
+        cursor = context.scene.cursor.location
+
+        sx, sy, _ = _snap_to_tile_center(cursor.x, cursor.y, room_d)
+
+        emp = bpy.data.objects.new(_auto_event_name(self.event_type), None)
+        emp.location = (sx, sy, cursor.z)
+        _apply_event_display(emp, self.event_type)
+
+        emp['r3st_event_type'] = self.event_type
+        emp.id_properties_ui('r3st_event_type').update(
+            description="R3ST event type — TRANSITION / NPC / ITEM / TRIGGER")
+
+        events_col = get_or_create_collection(EVENTS_COLLECTION)
+        link_to_collection(emp, events_col)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        emp.select_set(True)
+        context.view_layer.objects.active = emp
+
+        tx, ty = _blender_to_tile(sx, sy, room_d)
+        self.report({'INFO'}, f"Added {self.event_type} event at tile ({tx}, {ty})")
+        return {'FINISHED'}
+
+
+class R3ST_OT_set_event_type(Operator):
+    bl_idname      = "r3st.set_event_type"
+    bl_label       = "Set Type"
+    bl_description = "Change the event type of the selected event empty"
+
+    event_type: StringProperty(default='TRANSITION', options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'EMPTY' or 'r3st_event_type' not in obj:
+            self.report({'WARNING'}, "Select an event empty first.")
+            return {'CANCELLED'}
+        obj['r3st_event_type'] = self.event_type
+        _apply_event_display(obj, self.event_type)
+        return {'FINISHED'}
+
+
+class R3ST_OT_refresh_map_cache(Operator):
+    bl_idname      = "r3st.refresh_map_cache"
+    bl_label       = "Refresh Map List"
+    bl_description = "Re-read MapInfos.json to update the target map name display"
+
+    def execute(self, context):
+        _refresh_map_name_cache(context.scene.r3st_setup.project_dir)
+        self.report({'INFO'}, f"Refreshed — {len(_map_name_cache)} map(s) found")
+        return {'FINISHED'}
+
+
+class R3ST_OT_snap_events_to_grid(Operator):
+    bl_idname      = "r3st.snap_events_to_grid"
+    bl_label       = "Snap Events to Grid"
+    bl_description = "Snap selected event empties to the nearest tile center"
+
+    def execute(self, context):
+        room_d  = context.scene.r3st_room.room_d
+        snapped = 0
+        for obj in context.selected_objects:
+            if obj.type == 'EMPTY' and 'r3st_event_type' in obj:
+                sx, sy, _ = _snap_to_tile_center(obj.location.x, obj.location.y, room_d)
+                obj.location.x = sx
+                obj.location.y = sy
+                snapped += 1
+        self.report({'INFO'}, f"Snapped {snapped} event(s) to tile grid")
+        return {'FINISHED'}
+
+
+class R3ST_OT_export_events(Operator):
+    bl_idname      = "r3st.export_events"
+    bl_label       = "Export Events"
+    bl_description = ("Write all event empties to "
+                      "{project_root}/data/r3st_events_{map_name}.json")
+
+    def execute(self, context):
+        s      = context.scene.r3st_setup
+        t      = context.scene.r3st_tileset
+        room_d = context.scene.r3st_room.room_d
+
+        if not s.project_dir:
+            self.report({'ERROR'}, "Set the Project Root in Scene Setup first.")
+            return {'CANCELLED'}
+
+        empties = _get_event_empties()
+        if not empties:
+            self.report({'WARNING'}, "No event empties in the Events collection.")
+            return {'CANCELLED'}
+
+        events_list = []
+        for obj in empties:
+            tx, ty    = _blender_to_tile(obj.location.x, obj.location.y, room_d)
+            data_dict = _serialize_event(obj)
+            entry     = {'name': obj.name, 'x': tx, 'y': ty}
+            entry.update(data_dict)
+            events_list.append(entry)
+
+        events_list.sort(key=lambda e: (e['y'], e['x']))
+
+        root     = bpy.path.abspath(s.project_dir)
+        data_dir = os.path.join(root, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        map_name = t.map_name.strip() or 'Map_01'
+        out_path = os.path.join(data_dir, f'r3st_events_{map_name}.json')
+
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump({'map': map_name, 'events': events_list}, f, indent=2)
+
+        print(f'[R3ST] Events → {out_path}  ({len(events_list)} event(s))')
+        self.report({'INFO'},
+                    f"Exported {len(events_list)} event(s) → "
+                    f"data/r3st_events_{map_name}.json")
+        return {'FINISHED'}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAP MANAGEMENT OPERATORS  (v0.4 — multi-map system)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class R3ST_OT_refresh_rp_maps(Operator):
+    """Refresh the RPG Maker map list from MapInfos.json."""
+    bl_idname      = "r3st.refresh_rp_maps"
+    bl_label       = "Refresh Map List"
+    bl_description = "Re-read MapInfos.json to update the available maps list"
+
+    def execute(self, context):
+        project_dir = context.scene.r3st_setup.project_dir
+        _refresh_rp_map_cache(project_dir)
+        self.report({'INFO'}, f"Refreshed — {len(_rp_map_cache)} map(s) found in project")
+        return {'FINISHED'}
+
+
+class R3ST_OT_pick_map(Operator):
+    """
+    Popup dialog listing all maps from MapInfos.json.
+    Each row shows map id+name and whether a matching Blender scene exists.
+    Clicking "Switch" calls R3ST_OT_switch_map for that map.
+    Not using EnumProperty for the list — avoids the GC-crash risk with
+    dynamic enum items seen with _pkg_cache.  Uses a plain IntProperty instead.
+    """
+    bl_idname      = "r3st.pick_map"
+    bl_label       = "Map Selection"
+    bl_description = "Pick a map from your RPG Maker project to switch to or create"
+
+    def invoke(self, context, event):
+        project_dir = context.scene.r3st_setup.project_dir
+        _ensure_rp_map_cache(project_dir)
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        col    = layout.column(align=True)
+
+        if not _rp_map_cache:
+            col.label(text="No maps found — set Project Root and refresh.", icon='INFO')
+            col.operator("r3st.refresh_rp_maps", icon='FILE_REFRESH')
+            return
+
+        # Header row
+        hdr = col.row()
+        hdr.label(text="ID")
+        hdr.label(text="Map Name")
+        hdr.label(text="Scene")
+        hdr.label(text="")
+        col.separator(factor=0.3)
+
+        for entry in _rp_map_cache:
+            mid  = entry['id']
+            name = entry['name']
+            scene = _find_scene_for_map_id(mid)
+
+            row = col.row(align=True)
+            row.label(text=f"{mid:03d}")
+            row.label(text=name)
+            if scene:
+                row.label(text=scene.name, icon='SCENE_DATA')
+            else:
+                row.label(text="—", icon='GHOST_DISABLED')
+
+            op = row.operator("r3st.switch_map", text="Switch")
+            op.map_id   = mid
+            op.map_name = name
+
+        col.separator(factor=0.5)
+        col.operator("r3st.refresh_rp_maps", text="Refresh List", icon='FILE_REFRESH')
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class R3ST_OT_switch_map(Operator):
+    """
+    Switch to the Blender scene whose map_id matches.
+    If no scene exists for this map, create one via bpy.ops.scene.new(type='EMPTY')
+    and pre-fill map_id, map_name, and project_dir from the current scene.
+    """
+    bl_idname      = "r3st.switch_map"
+    bl_label       = "Switch Map"
+    bl_description = "Switch to this map's Blender scene (creates one if needed)"
+
+    map_id:   IntProperty(default=1,   options={'SKIP_SAVE'})
+    map_name: StringProperty(default="", options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        mid    = self.map_id
+        mname  = self.map_name
+        target = _find_scene_for_map_id(mid)
+
+        if target:
+            context.window.scene = target
+            self.report({'INFO'}, f"Switched to scene '{target.name}'  (Map{mid:03d}: {mname})")
+        else:
+            # Create a new scene, copy project settings, pre-fill map info
+            src_scene = context.scene
+            src_s     = src_scene.r3st_setup
+            src_t     = src_scene.r3st_tileset
+
+            bpy.ops.scene.new(type='EMPTY')
+            new_scene = context.scene   # bpy.ops.scene.new makes new scene active
+
+            # Copy project settings
+            new_scene.r3st_setup.project_dir = src_s.project_dir
+            new_scene.r3st_setup.res_x       = src_s.res_x
+            new_scene.r3st_setup.res_y       = src_s.res_y
+            new_scene.r3st_setup.tile_px     = src_s.tile_px
+
+            # Pre-fill map identity
+            new_scene.r3st_tileset.map_id   = mid
+            new_scene.r3st_tileset.map_name = mname
+
+            # Name the Blender scene to match the map
+            new_scene.name = f'Map{mid:03d}'
+
+            self.report({'INFO'},
+                        f"Created new scene 'Map{mid:03d}' for Map{mid:03d}: {mname}.  "
+                        "Set map dimensions and run 'Build Room Mesh' to continue.")
+        return {'FINISHED'}
+
+
+class R3ST_OT_create_map(Operator):
+    """
+    Create a new Blender scene for a new RPG Maker map.
+    Copies project settings from the current scene.
+    The user fills in map_id, map_name, and dimensions after creation.
+    """
+    bl_idname      = "r3st.create_map"
+    bl_label       = "New Map"
+    bl_description = "Create a new Blender scene for a new RPG Maker map"
+
+    def execute(self, context):
+        src_scene = context.scene
+        src_s     = src_scene.r3st_setup
+        src_t     = src_scene.r3st_tileset
+
+        bpy.ops.scene.new(type='EMPTY')
+        new_scene = context.scene
+
+        # Copy project settings
+        new_scene.r3st_setup.project_dir = src_s.project_dir
+        new_scene.r3st_setup.res_x       = src_s.res_x
+        new_scene.r3st_setup.res_y       = src_s.res_y
+        new_scene.r3st_setup.tile_px     = src_s.tile_px
+
+        # Suggest the next available map_id
+        used_ids = set()
+        for sc in bpy.data.scenes:
+            if sc != new_scene:
+                try:
+                    used_ids.add(sc.r3st_tileset.map_id)
+                except Exception:
+                    pass
+        next_id = 1
+        while next_id in used_ids:
+            next_id += 1
+        new_scene.r3st_tileset.map_id   = next_id
+        new_scene.r3st_tileset.map_name = f'Map{next_id:03d}'
+        new_scene.name                  = f'Map{next_id:03d}'
+
+        self.report({'INFO'},
+                    f"New scene 'Map{next_id:03d}' created.  "
+                    "Set Map ID, Map Name, dimensions, then Build Room Mesh.")
+        return {'FINISHED'}
+
+
+class R3ST_OT_archive_map(Operator):
+    """
+    Tag the current scene as archived.
+    Archived scenes are greyed out in the map list but not deleted.
+    Reversible via Restore Map.
+    """
+    bl_idname      = "r3st.archive_map"
+    bl_label       = "Archive Map"
+    bl_description = "Hide this map from the active map list (reversible — does not delete files)"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        context.scene['r3st_archived'] = True
+        self.report({'INFO'},
+                    f"Scene '{context.scene.name}' archived — "
+                    "use Restore Map to make it visible again.")
+        return {'FINISHED'}
+
+
+class R3ST_OT_restore_map(Operator):
+    """Remove the archived tag from the current scene."""
+    bl_idname      = "r3st.restore_map"
+    bl_label       = "Restore Map"
+    bl_description = "Remove the archived tag from this scene — makes it visible in the map list"
+
+    def execute(self, context):
+        if 'r3st_archived' in context.scene:
+            del context.scene['r3st_archived']
+        self.report({'INFO'}, f"Scene '{context.scene.name}' restored.")
+        return {'FINISHED'}
+
+
+class R3ST_OT_delete_map(Operator):
+    """
+    Delete the current Blender scene.
+    Optionally also delete the matching RPG Maker files.
+    Shows a confirm dialog with a checkbox for RPG Maker file deletion.
+    """
+    bl_idname      = "r3st.delete_map"
+    bl_label       = "Delete Map"
+    bl_description = "Permanently delete this Blender scene (and optionally RPG Maker files)"
+
+    delete_rp_files: BoolProperty(
+        name="Also delete RPG Maker files",
+        description="Delete MapXXX.json, remove from MapInfos.json, delete models/MapXXX_* files",
+        default=False,
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        col    = layout.column(align=True)
+        col.label(text=f"Delete scene:  '{context.scene.name}'", icon='SCENE_DATA')
+        col.separator(factor=0.5)
+        col.prop(self, 'delete_rp_files')
+        if self.delete_rp_files:
+            col.separator(factor=0.3)
+            t   = context.scene.r3st_tileset
+            mid = t.map_id
+            warn = col.box().column(align=True)
+            warn.alert = True
+            warn.label(
+                text=f"⚠  Will permanently remove Map{mid:03d}.json,",
+                icon='ERROR')
+            warn.label(
+                text=f"     MapInfos.json entry, and models/Map{mid:03d}_* files.")
+        col.separator(factor=0.5)
+        col.label(text="This cannot be undone.", icon='INFO')
+
+    def execute(self, context):
+        scene     = context.scene
+        scene_name = scene.name
+        s         = scene.r3st_setup
+        t         = scene.r3st_tileset
+        mid       = t.map_id
+        mn        = t.map_name
+
+        # Must keep at least one Blender scene
+        if len(bpy.data.scenes) <= 1:
+            self.report({'ERROR'}, "Cannot delete the only scene in the file.")
+            return {'CANCELLED'}
+
+        # ── Optional: delete RPG Maker files ──────────────────────────────────
+        if self.delete_rp_files and s.project_dir:
+            root     = bpy.path.abspath(s.project_dir)
+            data_dir = os.path.join(root, 'data')
+
+            # Delete MapXXX.json
+            map_json = os.path.join(data_dir, f'Map{mid:03d}.json')
+            if os.path.exists(map_json):
+                try:
+                    os.remove(map_json)
+                    print(f'[R3ST] Deleted {map_json}')
+                except Exception as ex:
+                    print(f'[R3ST] Could not delete {map_json}: {ex}')
+
+            # Remove entry from MapInfos.json
+            map_infos_path = os.path.join(data_dir, 'MapInfos.json')
+            if os.path.exists(map_infos_path):
+                try:
+                    with open(map_infos_path, 'r', encoding='utf-8') as fh:
+                        infos = json.load(fh)
+                    # Set the entry to null (RPG Maker convention for deleted maps)
+                    for i, entry in enumerate(infos):
+                        if entry and entry.get('id') == mid:
+                            infos[i] = None
+                            break
+                    with open(map_infos_path, 'w', encoding='utf-8') as fh:
+                        json.dump(infos, fh, ensure_ascii=False)
+                    print(f'[R3ST] Removed Map{mid:03d} from MapInfos.json')
+                except Exception as ex:
+                    print(f'[R3ST] Could not update MapInfos.json: {ex}')
+
+            # Delete models/MapXXX_* files
+            models_dir = os.path.join(root, 'models')
+            if os.path.isdir(models_dir):
+                prefix = f'Map{mid:03d}_'
+                for fname in os.listdir(models_dir):
+                    if fname.startswith(prefix):
+                        try:
+                            os.remove(os.path.join(models_dir, fname))
+                            print(f'[R3ST] Deleted models/{fname}')
+                        except Exception as ex:
+                            print(f'[R3ST] Could not delete models/{fname}: {ex}')
+
+            # Invalidate caches
+            _refresh_rp_map_cache(s.project_dir)
+
+        # ── Delete the Blender scene ──────────────────────────────────────────
+        bpy.data.scenes.remove(scene, do_unlink=True)
+        self.report({'INFO'},
+                    f"Scene '{scene_name}' deleted"
+                    + (" + RPG Maker files removed" if self.delete_rp_files else "."))
+        return {'FINISHED'}
+
+
 # ── Panel 5: Preview ──────────────────────────────────────────────────────────
 
 class R3ST_PT_preview(Panel):
@@ -4029,7 +5118,8 @@ class R3ST_PT_preview(Panel):
         cfg_box.label(text="Configuration", icon='SETTINGS')
 
         # Live status
-        rig_ok = bool(bpy.data.objects.get(CAM_NAME))
+        _mn   = context.scene.r3st_tileset.map_name.strip() or 'Map'
+        rig_ok = bool(_get_cam(_mn))
         col_ok = bool(bpy.data.collections.get(PERSP_COLLECTION))
 
         sc_box = cfg_box.box().column(align=True)
@@ -4069,6 +5159,7 @@ class R3ST_PT_preview(Panel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _classes = (
+    R3ST_EventProps,
     R3ST_SetupProps,
     R3ST_RoomProps,
     R3ST_TilesetProps,
@@ -4091,6 +5182,19 @@ _classes = (
     R3ST_OT_start_render_walk,
     R3ST_OT_pick_tile_cell,
     R3ST_OT_open_tile_picker,
+    R3ST_OT_add_event,
+    R3ST_OT_set_event_type,
+    R3ST_OT_refresh_map_cache,
+    R3ST_OT_snap_events_to_grid,
+    R3ST_OT_export_events,
+    # ── v0.4 Map management ───────────────────────────────────────────────────
+    R3ST_OT_refresh_rp_maps,
+    R3ST_OT_pick_map,
+    R3ST_OT_switch_map,
+    R3ST_OT_create_map,
+    R3ST_OT_archive_map,
+    R3ST_OT_restore_map,
+    R3ST_OT_delete_map,
     R3ST_PT_main,
 )
 
@@ -4102,11 +5206,17 @@ def register():
     bpy.types.Scene.r3st_room    = bpy.props.PointerProperty(type=R3ST_RoomProps)
     bpy.types.Scene.r3st_tileset = bpy.props.PointerProperty(type=R3ST_TilesetProps)
     bpy.types.Scene.r3st_export  = bpy.props.PointerProperty(type=R3ST_ExportProps)
+    bpy.types.Object.r3st_event  = bpy.props.PointerProperty(type=R3ST_EventProps)
 
     # Viewport overlay — camera boundary rectangle
     global _r3st_bound_handler
     _r3st_bound_handler = bpy.types.SpaceView3D.draw_handler_add(
         _draw_cam_boundary, (), 'WINDOW', 'POST_VIEW')
+
+    # Viewport overlay — event tile outlines
+    global _r3st_events_handler
+    _r3st_events_handler = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_event_tiles, (), 'WINDOW', 'POST_VIEW')
 
 
 def unregister():
@@ -4117,16 +5227,22 @@ def unregister():
     _r3st_walk['active']    = False
     _r3st_walk['keys_held'] = set()
 
-    # Remove viewport overlay
+    # Remove viewport overlays
     global _r3st_bound_handler
     if _r3st_bound_handler is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_r3st_bound_handler, 'WINDOW')
         _r3st_bound_handler = None
 
+    global _r3st_events_handler
+    if _r3st_events_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_r3st_events_handler, 'WINDOW')
+        _r3st_events_handler = None
+
     del bpy.types.Scene.r3st_setup
     del bpy.types.Scene.r3st_room
     del bpy.types.Scene.r3st_tileset
     del bpy.types.Scene.r3st_export
+    del bpy.types.Object.r3st_event
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 
